@@ -1,0 +1,357 @@
+
+Workflow Components
+{
+  "name": "Shopify Order Webhook",
+  "type": "n8n-nodes-base.shopifyTrigger",
+  "parameters": {
+    "webhook": "orders/paid",
+    "credentials": "shopifyApi"
+  }
+}
+
+{
+  "name": "Process Order Data",
+  "type": "n8n-nodes-base.function",
+  "parameters": {
+    "functionCode": `
+      const order = items[0].json;
+      const lineItems = order.line_items;
+      
+      // Extract supplement products
+      const supplements = lineItems.filter(item => 
+        item.product_type === 'supplement' || 
+        item.vendor.toLowerCase().includes('supplement')
+      );
+      
+      return supplements.map(item => ({
+        order_id: order.id,
+        customer_email: order.email,
+        customer_name: order.shipping_address.name,
+        product_name: item.name,
+        quantity: item.quantity,
+        sku: item.sku,
+        variant_id: item.variant_id,
+        shipping_address: order.shipping_address,
+        total_price: order.total_price,
+        order_date: order.created_at
+      }));
+   
+  }
+}
+
+{
+  "name": "PrepCenter Fulfillment",
+  "type": "n8n-nodes-base.httpRequest",
+  "parameters": {
+    "method": "POST",
+    "url": "https://api.prepcenter.com/v1/orders",
+    "authentication": "headerAuth",
+    "headerAuth": {
+      "name": "Authorization",
+      "value": "Bearer {{$credentials.prepcenterApiKey}}"
+    },
+    "jsonParameters": true,
+    "body": {
+      "order": {
+        "external_order_id": "={{$json.order_id}}",
+        "customer": {
+          "name": "={{$json.customer_name}}",
+          "email": "={{$json.customer_email}}"
+        },
+        "shipping_address": "={{$json.shipping_address}}",
+        "line_items": [
+          {
+            "sku": "={{$json.sku}}",
+            "quantity": "={{$json.quantity}}",
+            "name": "={{$json.product_name}}"
+          }
+        ],
+        "shipping_method": "standard"
+      }
+    }
+  }
+}
+{
+  "name": "Generate Marketing Images",
+  "type": "n8n-nodes-base.httpRequest",
+  "parameters": {
+    "method": "POST",
+    "url": "https://api.openai.com/v1/images/generations",
+    "authentication": "headerAuth",
+    "headerAuth": {
+      "name": "Authorization",
+      "value": "Bearer {{$credentials.openaiApiKey}}"
+    },
+    "jsonParameters": true,
+    "body": {
+      "model": "dall-e-3",
+      "prompt": "Professional supplement product photography for {{$json.product_name}}, clean white background, premium packaging, health and wellness aesthetic, photorealistic, high quality commercial photography",
+      "n": 2,
+      "size": "1024x1024",
+      "quality": "hd",
+      "style": "natural"
+    }
+  }
+}
+{
+  "name": "Midjourney Alternative",
+  "type": "n8n-nodes-base.httpRequest",
+  "parameters": {
+    "method": "POST",
+    "url": "https://api.midjourney.com/v1/imagine",
+    "authentication": "headerAuth",
+    "headerAuth": {
+      "name": "Authorization",
+      "value": "Bearer {{$credentials.midjourneyApiKey}}"
+    },
+    "jsonParameters": true,
+    "body": {
+      "prompt": "{{$json.product_name}} supplement bottle, professional product photography, clean minimalist design, health branding, premium quality --ar 1:1 --v 6 --style raw",
+      "aspect_ratio": "1:1"
+    }
+  }
+}
+{
+  "name": "Contact Supliful",
+  "type": "n8n-nodes-base.httpRequest",
+  "parameters": {
+    "method": "POST",
+    "url": "https://api.supliful.com/v1/inventory/check",
+    "authentication": "headerAuth",
+    "headerAuth": {
+      "name": "X-API-Key",
+      "value": "{{$credentials.suplifulApiKey}}"
+    },
+    "jsonParameters": true,
+    "body": {
+      "products": [
+        {
+          "sku": "={{$json.sku}}",
+          "quantity": "={{$json.quantity}}"
+        }
+      ]
+    }
+  }
+}
+{
+  "name": "Email Suppliers",
+  "type": "n8n-nodes-base.gmail",
+  "parameters": {
+    "operation": "send",
+    "credentials": "gmailOAuth2",
+    "to": "orders@equinoxnutraceutical.com, hello@trubodywellness.com, sales@simpsonlabs.com",
+    "subject": "Urgent: Stock Inquiry for {{$json.product_name}} - Order #{{$json.order_id}}",
+    "emailType": "html",
+    "message": `
+      <html>
+      <body>
+        <h2>Stock Availability Request</h2>
+        <p>Dear Supplier,</p>
+        
+        <p>We have received an order for the following supplement and need to confirm availability:</p>
+        
+        <ul>
+          <li><strong>Product:</strong> {{$json.product_name}}</li>
+          <li><strong>SKU:</strong> {{$json.sku}}</li>
+          <li><strong>Quantity:</strong> {{$json.quantity}}</li>
+          <li><strong>Order ID:</strong> {{$json.order_id}}</li>
+          <li><strong>Order Date:</strong> {{$json.order_date}}</li>
+        </ul>
+        
+        <p>Please confirm:</p>
+        <ol>
+          <li>Current stock availability</li>
+          <li>Lead time for fulfillment</li>
+          <li>Bulk pricing for quantities over 100 units</li>
+          <li>COA (Certificate of Analysis) availability</li>
+        </ol>
+        
+        <p>Customer shipping address: {{$json.shipping_address.address1}}, {{$json.shipping_address.city}}, {{$json.shipping_address.province}}</p>
+        
+        <p>Please respond within 2 hours for expedited processing.</p>
+        
+        <p>Best regards,<br>
+        Supplement Brand Team</p>
+      </body>
+      </html>
+    `
+  }
+}
+{
+  "name": "Inventory Decision Logic",
+  "type": "n8n-nodes-base.function",
+  "parameters": {
+    "functionCode": `
+      const suplifulResponse = $('Contact Supliful').first().json;
+      const prepCenterStatus = $('PrepCenter Fulfillment').first().json;
+      
+      let fulfillmentDecision = {
+        order_id: items[0].json.order_id,
+        product_name: items[0].json.product_name,
+        fulfillment_method: 'pending',
+        supplier_choice: null,
+        stock_status: 'checking',
+        next_action: null
+      };
+      
+      // Priority logic for fulfillment
+      if (suplifulResponse.in_stock && suplifulResponse.quantity >= items[0].json.quantity) {
+        fulfillmentDecision.fulfillment_method = 'supliful_direct';
+        fulfillmentDecision.supplier_choice = 'supliful';
+        fulfillmentDecision.stock_status = 'available';
+        fulfillmentDecision.next_action = 'process_supliful_order';
+      } else if (prepCenterStatus.status === 'accepted') {
+        fulfillmentDecision.fulfillment_method = 'prepcenter';
+        fulfillmentDecision.stock_status = 'available';
+        fulfillmentDecision.next_action = 'monitor_prepcenter_fulfillment';
+      } else {
+        fulfillmentDecision.fulfillment_method = 'supplier_inquiry';
+        fulfillmentDecision.stock_status = 'out_of_stock';
+        fulfillmentDecision.next_action = 'wait_supplier_response';
+      }
+      
+      return [fulfillmentDecision];
+    `
+  }
+}
+{
+  "name": "Customer Update Email",
+  "type": "n8n-nodes-base.gmail",
+  "parameters": {
+    "operation": "send",
+    "credentials": "gmailOAuth2",
+    "to": "={{$json.customer_email}}",
+    "subject": "Order Confirmation - {{$json.product_name}} - Order #{{$json.order_id}}",
+    "emailType": "html",
+    "message": `
+      <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h1 style="color: #2c5aa0;">Order Confirmation</h1>
+          
+          <p>Dear {{$json.customer_name}},</p>
+          
+          <p>Thank you for your order! We're excited to get your premium supplements to you.</p>
+          
+          <div style="background: #f9f9f9; padding: 15px; border-radius: 5px; margin: 20px 0;">
+            <h3>Order Details:</h3>
+            <ul>
+              <li><strong>Order #:</strong> {{$json.order_id}}</li>
+              <li><strong>Product:</strong> {{$json.product_name}}</li>
+              <li><strong>Quantity:</strong> {{$json.quantity}}</li>
+              <li><strong>Total:</strong> ${{$json.total_price}}</li>
+            </ul>
+          </div>
+          
+          <p><strong>Fulfillment Status:</strong> {{$json.fulfillment_method}}</p>
+          <p><strong>Expected Shipping:</strong> 2-3 business days</p>
+          
+          <p>We'll send you tracking information as soon as your order ships.</p>
+          
+          <p>Questions? Reply to this email or contact our support team.</p>
+          
+          <p>Stay healthy!<br>
+          The Supplement Team</p>
+        </div>
+      </body>
+      </html>
+    `
+  }
+}
+{
+  "name": "Save Marketing Assets",
+  "type": "n8n-nodes-base.googleDrive",
+  "parameters": {
+    "operation": "upload",
+    "credentials": "googleDriveOAuth2",
+    "name": "{{$json.product_name}}_marketing_{{$json.order_date}}.png",
+    "parents": ["marketing_assets_folder_id"],
+    "binaryData": true,
+    "binaryPropertyName": "data"
+  }
+}
+{
+  "name": "Update Analytics Dashboard",
+  "type": "n8n-nodes-base.googleSheets",
+  "parameters": {
+    "operation": "append",
+    "credentials": "googleSheetsOAuth2",
+    "spreadsheetId": "your_analytics_spreadsheet_id",
+    "range": "Orders!A:K",
+    "values": [
+      [
+        "={{$json.order_id}}",
+        "={{$json.product_name}}",
+        "={{$json.quantity}}",
+        "={{$json.total_price}}",
+        "={{$json.customer_email}}",
+        "={{$json.fulfillment_method}}",
+        "={{$json.supplier_choice}}",
+        "={{$json.order_date}}",
+        "={{new Date().toISOString()}}",
+        "={{$json.stock_status}}",
+        "pending"
+      ]
+    ]
+  }
+}
+
+
+
+Required Credentials
+
+1. Shopify API: Store credentials for webhook triggers
+2. PrepCenter API: API key for fulfillment integration
+3. OpenAI API: For DALL-E image generation
+4. Midjourney API: Alternative image generation
+5. Supliful API: Supplier integration
+6. Gmail OAuth2: For supplier and customer communication
+7. Google Drive OAuth2:Marketing asset storage
+8. Google Sheets OAuth2:Analytics tracking
+
+Environment Variables
+
+// Add these to your n8n environment
+PREPCENTER_API_KEY="your_prepcenter_key"
+OPENAI_API_KEY="your_openai_key"
+MIDJOURNEY_API_KEY="your_midjourney_key"
+SUPLIFUL_API_KEY="your_supliful_key"
+ANALYTICS_SPREADSHEET_ID="your_sheet_id"
+MARKETING_FOLDER_ID="your_drive_folder_id"
+
+Conditional Logic Branches
+Stock Availablem: 
+Route to immediate fulfillment
+Out of Stock: 
+Trigger supplier inquiry emails
+Partial Stock: Split order across multiple suppliers
+-High Volume:Auto-negotiate bulk pricing
+
+Error Handling
+{
+  "name": "Error Handler",
+  "type": "n8n-nodes-base.function",
+  "parameters": {
+    "functionCode": `
+      if ($input.all().length === 0) {
+        return [{
+          json: {
+            error: "No order data received",
+            action: "retry_webhook",
+            timestamp: new Date().toISOString()
+          }
+        }];
+      }
+      
+      // Log errors to monitoring system
+      const errorData = {
+        workflow: "shopify_supplement_assistant",
+        error: $json.error,
+        order_id: $json.order_id || 'unknown',
+        timestamp: new Date().toISOString()
+      };
+      
+      return [errorData];
+    `
+  }
+}
